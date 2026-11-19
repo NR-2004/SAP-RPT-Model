@@ -43,22 +43,22 @@ SAP_USERNAME = os.getenv("SAP_USERNAME", "").strip()
 SAP_PASSWORD = os.getenv("SAP_PASSWORD", "")
 VERIFY = os.getenv("SAP_VERIFY_SSL", "true").lower() == "true"
 
-CSV_PATH = BASE_DIR / "historical_po_delay_training.csv"
+# Training data: completed PO items from this S/4 system. Override with TRAINING_CSV in .env.
+CSV_PATH = BASE_DIR / os.getenv("TRAINING_CSV", "po_history/po_delay_training_s4.csv")
 PO_SERVICE = "API_PURCHASEORDER_PROCESS_SRV"
-MATDOC_SERVICE = "API_MATERIAL_DOCUMENT_SRV"
 
 INDEX = "RowId"
 TARGET = "DelayDays"
 PLACEHOLDER = "[PREDICT]"
-# Sent to SAP-RPT-1. Tested on hold-out data: Supplier carries almost all the signal; Material, Plant,
-# PurchasingOrg/Group, unit and month/weekday added noise (lower R2), so they are not sent.
-FEATURES = ["Supplier", "LeadTimeDays", "OrderQuantity"]
+# Sent to SAP-RPT-1. Chosen on hold-out tests with the S/4 history (po_delay_training_s4.csv):
+# this set had the lowest MAE; PurchasingOrg/Group, Plant, unit, month and weekday added noise.
+FEATURES = ["Supplier", "Material", "MaterialGroup", "LeadTimeDays", "OrderQuantity"]
+# History rows with |DelayDays| above this are treated as data errors (e.g. receipt years later) and skipped.
+MAX_ABS_DELAY = int(os.getenv("MAX_ABS_DELAY", "180"))
 
 # Never sent to the model: IDs, leakage fields, and constant/empty/duplicate columns.
-EXCLUDED = ["PurchaseOrder", "PurchaseOrderItem", "ScheduleLine", "CompanyCode", "MaterialGroup", "ScheduleLineOrderQuantity", "ActualGoodsReceiptDate", "DeliveryStatus", "PurchaseOrderType"]
+EXCLUDED = ["PurchaseOrder", "PurchaseOrderItem", "ScheduleLine", "CompanyCode", "ScheduleLineOrderQuantity", "ActualGoodsReceiptDate", "DeliveryStatus", "PurchaseOrderType"]
 
-# Goods receipt movement types: +1 receipt, -1 reversal/return.
-GR_MOVEMENTS = {"101": 1, "102": -1, "103": 1, "104": -1, "122": -1, "123": 1}
 
 # Required inputs for this use case -> missing any of these means the app cannot run.
 REQUIRED_ENV_VARS = [
@@ -67,8 +67,8 @@ REQUIRED_ENV_VARS = [
 ]
 REQUIRED_CSV_COLUMNS = [
     "PurchaseOrder", "PurchaseOrderItem", "ScheduleLine", "Supplier", "Material", "PurchasingOrganization", "PurchasingGroup",
-    "Plant", "PurchaseOrderType", "OrderQuantityUnit", "OrderQuantity",
-    "CreationDate", "ScheduleLineDeliveryDate", "ActualGoodsReceiptDate", "DelayDays",
+    "Plant", "PurchaseOrderType", "MaterialGroup", "OrderQuantityUnit", "OrderQuantity",
+    "PurchaseOrderDate", "CreationDate", "ScheduleLineDeliveryDate", "ActualGoodsReceiptDate", "DelayDays",
 ]
 
 
@@ -132,6 +132,29 @@ class PredictRequest(BaseModel):
         if self.level not in ("schedule_line", "item"):
             raise ValueError("level must be 'schedule_line' or 'item'")
         return self
+
+
+class POLine(BaseModel):
+    """One PO item / schedule line given directly in the request (no S/4 lookup)."""
+    PurchaseOrder: str = "TEST"
+    PurchaseOrderItem: str = "10"
+    ScheduleLine: str = "1"
+    Supplier: str
+    Material: str = ""
+    MaterialGroup: str = ""
+    PurchasingOrganization: str = ""
+    PurchasingGroup: str = ""
+    PurchaseOrderType: str = "NB"
+    Plant: str = ""
+    OrderQuantity: float
+    OrderQuantityUnit: str = ""
+    CreationDate: date
+    PurchaseOrderDate: date | None = None   # order date; defaults to CreationDate
+    ScheduleLineDeliveryDate: date   # planned delivery date
+
+
+class PredictDataRequest(BaseModel):
+    items: list[POLine]
 
 
 # ---------------------------------------------------------
@@ -242,11 +265,16 @@ def rpt_predict(context, queries):
         "parse_data_types": True,
         "rows": rows,
     }
-    response = requests.post(endpoint, json=body, verify=True, timeout=300, headers={
-        "Authorization": "Bearer " + token,
-        "AI-Resource-Group": RESOURCE_GROUP,
-        "Content-Type": "application/json",
-    })
+    for attempt in range(3):   # AI Core sometimes answers 500/502/503/504 under load -> retry
+        response = requests.post(endpoint, json=body, verify=True, timeout=300, headers={
+            "Authorization": "Bearer " + token,
+            "AI-Resource-Group": RESOURCE_GROUP,
+            "Content-Type": "application/json",
+        })
+        if response.status_code not in (500, 502, 503, 504):
+            break
+        log.warning("SAP-RPT-1 HTTP %s, retrying (%s/3)", response.status_code, attempt + 1)
+        time.sleep(5 * (attempt + 1))
     if not response.ok:
         raise RuntimeError(f"SAP-RPT-1 HTTP {response.status_code}: {response.text[:1000]}")
 
@@ -271,7 +299,7 @@ def select_context(history, queries):
     """Most relevant history first: same supplier, then same material, then most recent."""
     suppliers, materials = set(queries["Supplier"]), set(queries["Material"])
     score = history["Supplier"].isin(suppliers) * 2 + history["Material"].isin(materials)
-    ranked = history.assign(_score=score).sort_values(["_score", "CreationDate"], ascending=False)
+    ranked = history.assign(_score=score).sort_values(["_score", "PurchaseOrderDate"], ascending=False)
     return ranked.head(RPT_CONTEXT_ROWS).drop(columns="_score")
 
 
@@ -293,11 +321,13 @@ def build_features(df):
     out = pd.DataFrame(index=df.index)
     out["Supplier"] = df["Supplier"].map(norm_key)
     out["Material"] = df["Material"].map(norm_key)
-    for col in ("PurchasingOrganization", "PurchasingGroup", "Plant", "OrderQuantityUnit"):
-        out[col] = df[col].astype(str).str.strip().str.upper()
+    for col in ("PurchasingOrganization", "PurchasingGroup", "Plant", "OrderQuantityUnit", "MaterialGroup"):
+        out[col] = df[col].fillna("").astype(str).str.strip().str.upper()
     planned = pd.to_datetime(df["ScheduleLineDeliveryDate"])
     out["OrderQuantity"] = pd.to_numeric(df["OrderQuantity"], errors="coerce").round(3)
-    out["LeadTimeDays"] = (planned - pd.to_datetime(df["CreationDate"])).dt.days
+    # PurchaseOrderDate = real order date. CreationDate is when the PO was entered in S/4
+    # (bulk-loaded POs get the load date, which made lead times negative).
+    out["LeadTimeDays"] = (planned - pd.to_datetime(df["PurchaseOrderDate"])).dt.days
     out["PlannedMonth"] = planned.dt.month
     out["PlannedDayOfWeek"] = planned.dt.day_of_week
     return out
@@ -305,18 +335,23 @@ def build_features(df):
 
 def load_history():
     text_cols = ["PurchaseOrder", "PurchaseOrderItem", "ScheduleLine", "CompanyCode", "Supplier", "Material", "PurchasingOrganization",
-                 "PurchasingGroup", "Plant", "PurchaseOrderType", "OrderQuantityUnit"]
+                 "PurchasingGroup", "Plant", "PurchaseOrderType", "OrderQuantityUnit", "MaterialGroup"]
     df = pd.read_csv(CSV_PATH, dtype={c: str for c in text_cols},
-                     parse_dates=["CreationDate", "ScheduleLineDeliveryDate", "ActualGoodsReceiptDate"])
+                     parse_dates=["PurchaseOrderDate", "CreationDate", "ScheduleLineDeliveryDate", "ActualGoodsReceiptDate"])
     mismatch = int(((df["ActualGoodsReceiptDate"] - df["ScheduleLineDeliveryDate"]).dt.days != df[TARGET]).sum())
     log.info("History rows: %s | missing values: %s | DelayDays/date mismatches: %s",
              len(df), int(df.isna().sum().sum()), mismatch)
-    df = df.dropna(subset=["Supplier", "ScheduleLineDeliveryDate", "CreationDate", TARGET])
+    df = df.dropna(subset=["Supplier", "ScheduleLineDeliveryDate", "PurchaseOrderDate", TARGET])
+    outliers = df[TARGET].abs() > MAX_ABS_DELAY
+    if outliers.any():
+        log.info("Skipping %s history rows with |DelayDays| > %s", int(outliers.sum()), MAX_ABS_DELAY)
+        df = df[~outliers]
     history = build_features(df)
     history[INDEX] = "H" + df["PurchaseOrder"] + "-" + df["PurchaseOrderItem"] + "-" + df["ScheduleLine"]
-    history["CreationDate"] = df["CreationDate"]
+    history["PurchaseOrderDate"] = df["PurchaseOrderDate"]
+    history["PurchaseOrderType"] = df["PurchaseOrderType"]
     history[TARGET] = df[TARGET]
-    return history.sort_values("CreationDate").reset_index(drop=True)
+    return history.sort_values("PurchaseOrderDate").reset_index(drop=True)
 
 
 # ---------------------------------------------------------
@@ -426,7 +461,7 @@ def fetch_purchase_orders(po_numbers=None, created_from=None, created_to=None, l
 
     headers = sap_rows(PO_SERVICE, "A_PurchaseOrder",
                        ["PurchaseOrder", "Supplier", "PurchasingOrganization", "PurchasingGroup",
-                        "PurchaseOrderType", "CompanyCode", "CreationDate"],
+                        "PurchaseOrderType", "CompanyCode", "CreationDate", "PurchaseOrderDate"],
                        " and ".join(conditions) or None, orderby="CreationDate desc,PurchaseOrder desc", limit=max_pos)
     header_by_po = {h["PurchaseOrder"]: h for h in headers}
     po_list = list(header_by_po)
@@ -463,9 +498,11 @@ def fetch_purchase_orders(po_numbers=None, created_from=None, created_to=None, l
                     "PurchasingGroup": header["PurchasingGroup"],
                     "PurchaseOrderType": header["PurchaseOrderType"],
                     "Plant": item["Plant"],
+                    "MaterialGroup": item["MaterialGroup"],
                     "OrderQuantity": float(item["OrderQuantity"] or 0),
                     "OrderQuantityUnit": item["PurchaseOrderQuantityUnit"],
                     "CreationDate": sap_date(header["CreationDate"]),
+                    "PurchaseOrderDate": sap_date(header["PurchaseOrderDate"] or header["CreationDate"]),
                     "ScheduleLineDeliveryDate": sap_date(line["ScheduleLineDeliveryDate"]),
                 })
     df = pd.DataFrame(rows)
@@ -475,36 +512,7 @@ def fetch_purchase_orders(po_numbers=None, created_from=None, created_to=None, l
 
 
 # ---------------------------------------------------------
-# 10. GOODS RECEIPTS (history validation only, never for prediction)
-# ---------------------------------------------------------
-
-def actual_gr_dates(po_numbers):
-    """Actual GR date per PO item, net of reversals (102) and returns (122)."""
-    items = sap_rows(MATDOC_SERVICE, "A_MaterialDocumentItem",
-                     ["PurchaseOrder", "PurchaseOrderItem", "Material", "Plant", "GoodsMovementType",
-                      "PostingDate", "MaterialDocument", "MaterialDocumentYear", "MaterialDocumentItem",
-                      "QuantityInEntryUnit", "EntryUnit"],
-                     f"{or_filter('PurchaseOrder', po_numbers)} and {or_filter('GoodsMovementType', list(GR_MOVEMENTS))}")
-    df = pd.DataFrame(items)
-    if df.empty:
-        return {}
-    df = df.drop_duplicates(["MaterialDocumentYear", "MaterialDocument", "MaterialDocumentItem"])
-    df["PostingDate"] = df["PostingDate"].map(sap_date)
-    df["Net"] = df["QuantityInEntryUnit"].astype(float) * df["GoodsMovementType"].map(GR_MOVEMENTS)
-
-    result = {}
-    for (po, item), g in df.groupby(["PurchaseOrder", "PurchaseOrderItem"]):
-        daily = g.groupby("PostingDate")["Net"].sum().sort_index().cumsum()
-        if daily.iloc[-1] <= 0:
-            continue  # fully reversed
-        zero = daily[daily <= 0]
-        valid = daily[daily.index > zero.index[-1]] if len(zero) else daily
-        result[(po, str(item).lstrip("0"))] = str(valid.index[0])
-    return result
-
-
-# ---------------------------------------------------------
-# 11. PREDICTION FOR NEW POs
+# 10. PREDICTION FOR NEW POs
 # ---------------------------------------------------------
 
 def predict(rows):
@@ -514,16 +522,21 @@ def predict(rows):
     queries = build_features(rows)
     queries[INDEX] = "Q" + rows.index.astype(str)
     delays = np.rint(predict_delays(history, queries)).astype(int)
+    # A delivery cannot arrive before the PO exists: cap early predictions at the PO date.
+    lead = queries["LeadTimeDays"].to_numpy()
+    capped = (lead >= 0) & (delays < -lead)
+    delays = np.where(capped, -lead, delays)
 
     known_suppliers, known_materials = set(history["Supplier"]), set(history["Material"])
+    known_types = set(history["PurchaseOrderType"])
     output = []
-    for (_, row), (_, f), delay in zip(rows.iterrows(), queries.iterrows(), delays):
-        notes = []
+    for (_, row), (_, f), delay, cap in zip(rows.iterrows(), queries.iterrows(), delays, capped):
+        notes = ["capped at PO date"] if cap else []
         if f["Supplier"] not in known_suppliers:
             notes.append("new supplier")
         if f["Material"] not in known_materials:
             notes.append("material not in history")
-        if row["PurchaseOrderType"] != "NB":
+        if row["PurchaseOrderType"] not in known_types:
             notes.append(f"PO type {row['PurchaseOrderType']} not in history")
         output.append({
             "PurchaseOrder": row["PurchaseOrder"],
@@ -544,7 +557,7 @@ def predict(rows):
 
 
 # ---------------------------------------------------------
-# 12. ENDPOINTS
+# 11. ENDPOINTS
 # ---------------------------------------------------------
 
 ERRORS = (requests.RequestException, RuntimeError, KeyError, ValueError, TypeError)
@@ -589,20 +602,24 @@ def predict_delay(request: PredictRequest):
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-@app.get("/goods-receipts/{purchase_order}")
-def goods_receipts(purchase_order: str):
+@app.post("/predict-delay-data")
+def predict_delay_data(request: PredictDataRequest):
+    """Same prediction, but PO lines come from the request body instead of S/4 (for testing)."""
     require_config()
+    if not request.items:
+        raise HTTPException(status_code=400, detail="items is empty")
     try:
-        dates = actual_gr_dates([purchase_order])
-        return {"PurchaseOrder": purchase_order,
-                "Items": [{"PurchaseOrderItem": item, "ActualGoodsReceiptDate": d}
-                          for (_, item), d in dates.items()]}
+        rows = pd.DataFrame([item.model_dump() for item in request.items])
+        rows["PurchaseOrderDate"] = rows["PurchaseOrderDate"].fillna(rows["CreationDate"])
+        results = predict(rows)
+        return {"Count": len(results), "Model": "SAP-RPT-1", "Predictions": results}
     except ERRORS as exc:
+        log.exception("PO delay prediction (data) failed")
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------
-# 13. LOCAL RUN:  python main.py   |   python main.py evaluate [rows]   |   python main.py config-check
+# 12. LOCAL RUN:  python main.py   |   python main.py evaluate [rows]   |   python main.py config-check
 # ---------------------------------------------------------
 
 if __name__ == "__main__":

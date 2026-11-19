@@ -6,3 +6,4 @@ models/
 extract_po_history.py
 po_history_extract.csv
 po_history_extract.json
+po_history/
